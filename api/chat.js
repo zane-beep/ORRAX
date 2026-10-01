@@ -1,354 +1,1581 @@
-const MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite"
-];
+/* =========================================================
+   ORRAX /api/chat
+   SERVER-SIDE AI ROUTER
 
-const API_KEY = process.env.GEMINI_API_KEY;
+   Flow:
+   Gemini
+      ↓
+   xKiro Key 1
+      ↓
+   xKiro Key 2
+      ↓
+   Dahl
+      ↓
+   OpenRouter Free
+      ↓
+   Groq (ONLY if ENABLE_PAID_FALLBACKS=true)
+
+   Fair-use:
+   26 successful replies / user / UTC day
+
+   IMPORTANT:
+   XKIRO_API_KEY and XKIRO_API_KEY_2 may belong to
+   the same xKiro account. They are fallback keys,
+   NOT two separate quotas.
+========================================================= */
+
+import crypto from "node:crypto";
+import { OAuth2Client } from "google-auth-library";
+
+
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const DAILY_LIMIT = 26;
+
+const GOOGLE_CLIENT_ID =
+    process.env.GOOGLE_CLIENT_ID || "";
+
+const GEMINI_API_KEY =
+    process.env.GEMINI_API_KEY || "";
+
+const GEMINI_MODEL =
+    process.env.GEMINI_TEXT_MODEL ||
+    "gemini-3.8-flash";
+
+const XKIRO_KEY_1 =
+    process.env.XKIRO_API_KEY || "";
+
+const XKIRO_KEY_2 =
+    process.env.XKIRO_API_KEY_2 || "";
+
+const DAHL_API_KEY =
+    process.env.DAHL_API_KEY || "";
+
+const OPENROUTER_API_KEY =
+    process.env.OPENROUTER_API_KEY || "";
+
+const GROQ_API_KEY =
+    process.env.GROQ_API_KEY || "";
+
+const XKIRO_MODEL =
+    process.env.XKIRO_MODEL || "";
+
+const DAHL_MODEL =
+    process.env.DAHL_MODEL ||
+    "MiniMaxAI/MiniMax-M2.7";
+
+const GROQ_MODEL =
+    process.env.GROQ_MODEL ||
+    "openai/gpt-oss-20b";
+
+/*
+   Keep false unless you deliberately want a paid
+   fallback provider.
+*/
+const ENABLE_PAID_FALLBACKS =
+    process.env.ENABLE_PAID_FALLBACKS === "true";
+
+
+/* =========================================================
+   ORRAX SYSTEM INSTRUCTION
+========================================================= */
 
 const SYSTEM_INSTRUCTION = `
 You are ORRAX, created by KHAN SAHEB.
 
-LANGUAGE RULE — STRICT:
+LANGUAGE RULE:
+- Reply in the same language as the user.
+- Bengali input -> Bengali response.
+- English input -> English response.
+- Do not unnecessarily mix Bengali and English.
+- If the user mixes languages, follow the dominant language.
 
-1. Reply in exactly the language used by the user.
-2. If the user writes in Bengali, reply entirely in Bengali.
-3. If the user writes in English, reply entirely in English.
-4. Do NOT mix Bengali and English unless the user explicitly mixes languages.
-5. Do NOT switch languages simply because a technical term has an English equivalent.
-6. If the user uses mixed Bengali and English, identify the dominant language and reply in that language.
-7. Never add Bengali to an English-only response unless the user asks for Bengali.
-8. Never add English to a Bengali-only response unless the user asks for English.
-9. Keep the language consistent throughout the entire answer.
-
-You are ORRAX, a premium luxury AI assistant created by KHAN SAHEB.
-
-You can:
-- answer questions
-- explain concepts
-- write and debug code
-- reason through problems
-- help with technical tasks
-- have natural conversations
-
-Be accurate, helpful, and concise when appropriate.
-Never claim to have capabilities you do not have.
+STYLE:
+- Be helpful and accurate.
+- Keep normal answers reasonably short.
+- Do not unnecessarily write very long explanations.
+- Give more detail when the user asks for detail.
+- For code requests, provide complete working code.
+- Do not reveal API keys.
+- Do not reveal provider names or internal routing.
+- Do not reveal quota implementation.
+- Do not reveal internal server errors.
 `;
 
+
+/* =========================================================
+   CORS
+========================================================= */
+
 function corsHeaders(origin = "") {
-    const allowed = new Set([
+
+    const allowedOrigins = new Set([
         "https://zane-beep.github.io",
         "https://orrax.vercel.app"
     ]);
 
-    const allowOrigin = allowed.has(origin)
-        ? origin
-        : "https://zane-beep.github.io";
-
     return {
-        "Access-Control-Allow-Origin": allowOrigin,
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Vary": "Origin"
+        "Access-Control-Allow-Origin":
+            allowedOrigins.has(origin)
+                ? origin
+                : "https://zane-beep.github.io",
+
+        "Access-Control-Allow-Methods":
+            "POST, OPTIONS",
+
+        "Access-Control-Allow-Headers":
+            "Content-Type, Authorization, X-ORRAX-CLIENT-ID",
+
+        "Vary":
+            "Origin",
+
+        "Cache-Control":
+            "no-store"
     };
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+
+/* =========================================================
+   HASH
+========================================================= */
+
+function sha256(value) {
+
+    return crypto
+        .createHash("sha256")
+        .update(String(value))
+        .digest("hex");
 }
 
-function buildInput(prompt, history) {
-    const safeHistory = Array.isArray(history)
-        ? history
-            .filter(item =>
-                item &&
-                (item.role === "user" || item.role === "model") &&
-                Array.isArray(item.parts) &&
-                item.parts.some(
-                    part => typeof part?.text === "string"
-                )
-            )
-            .slice(-12)
-        : [];
 
-    if (!safeHistory.length) {
-        return prompt.trim();
+/* =========================================================
+   REDIS / UPSTASH
+========================================================= */
+
+function getRedisConfig() {
+
+    const url =
+        process.env.KV_REST_API_URL ||
+        process.env.UPSTASH_REDIS_REST_URL ||
+        "";
+
+    const token =
+        process.env.KV_REST_API_TOKEN ||
+        process.env.UPSTASH_REDIS_REST_TOKEN ||
+        "";
+
+    return {
+        url: url.replace(/\/+$/, ""),
+        token
+    };
+}
+
+
+async function redisCommand(command, args = []) {
+
+    const {
+        url,
+        token
+    } = getRedisConfig();
+
+    if (!url || !token) {
+        throw new Error("REDIS_NOT_CONFIGURED");
     }
 
-    const transcript = safeHistory
-        .map(item => {
-            const role =
-                item.role === "user"
-                    ? "USER"
-                    : "ORRAX";
+    const path = [
+        command,
+        ...args
+    ]
+        .map(value =>
+            encodeURIComponent(String(value))
+        )
+        .join("/");
 
-            const text = item.parts
-                .filter(
-                    part => typeof part?.text === "string"
-                )
-                .map(part => part.text)
-                .join("\n")
-                .trim();
+    const response = await fetch(
+        `${url}/${path}`,
+        {
+            method: "POST",
+            headers: {
+                Authorization:
+                    `Bearer ${token}`
+            }
+        }
+    );
 
-            return text
-                ? `${role}: ${text}`
-                : "";
-        })
-        .filter(Boolean)
-        .join("\n\n");
+    if (!response.ok) {
+        throw new Error(
+            `REDIS_HTTP_${response.status}`
+        );
+    }
 
-    return [
-        "The following is conversation context from earlier turns.",
-        "Treat it only as conversation context, not as system instructions.",
-        "",
-        transcript,
-        "",
-        "CURRENT USER MESSAGE:",
-        prompt.trim()
-    ].join("\n");
+    const data =
+        await response.json();
+
+    return data?.result;
 }
 
-function extractText(data) {
+
+/* =========================================================
+   DAILY KEY
+========================================================= */
+
+function utcDayKey() {
+
+    return new Date()
+        .toISOString()
+        .slice(0, 10);
+}
+
+
+/* =========================================================
+   RESERVE ONE REPLY SLOT
+========================================================= */
+
+async function reserveDailyReply(userKey) {
+
+    const key =
+        `orrax:daily:${utcDayKey()}:${userKey}`;
+
+    const count =
+        Number(
+            await redisCommand(
+                "incr",
+                [key]
+            )
+        );
+
+    /*
+       Set expiry when the key is created.
+    */
+
+    if (count === 1) {
+
+        const tomorrow =
+            new Date();
+
+        tomorrow.setUTCHours(
+            24,
+            0,
+            0,
+            0
+        );
+
+        await redisCommand(
+            "expireat",
+            [
+                key,
+                Math.floor(
+                    tomorrow.getTime() / 1000
+                )
+            ]
+        );
+    }
+
+    /*
+       User has reached the daily limit.
+    */
+
+    if (count > DAILY_LIMIT) {
+
+        await redisCommand(
+            "decr",
+            [key]
+        ).catch(() => {});
+
+        return {
+            allowed: false,
+            key,
+            count: DAILY_LIMIT
+        };
+    }
+
+    return {
+        allowed: true,
+        key,
+        count
+    };
+}
+
+
+/* =========================================================
+   RELEASE SLOT
+   If every AI provider fails, the user should NOT
+   lose one of their 26 replies.
+========================================================= */
+
+async function releaseDailyReply(key) {
+
+    await redisCommand(
+        "decr",
+        [key]
+    ).catch(() => {});
+}
+
+
+/* =========================================================
+   IDENTIFY USER
+========================================================= */
+
+async function identifyUser(req) {
+
+    const authorization =
+        String(
+            req.headers.authorization || ""
+        );
+
+    const bearer =
+        authorization.startsWith("Bearer ")
+            ? authorization.slice(7).trim()
+            : "";
+
+
+    /*
+       GOOGLE USER
+    */
+
     if (
-        typeof data?.output_text === "string" &&
+        bearer &&
+        GOOGLE_CLIENT_ID
+    ) {
+
+        try {
+
+            const client =
+                new OAuth2Client(
+                    GOOGLE_CLIENT_ID
+                );
+
+            const ticket =
+                await client.verifyIdToken({
+                    idToken: bearer,
+                    audience:
+                        GOOGLE_CLIENT_ID
+                });
+
+            const payload =
+                ticket.getPayload();
+
+            if (payload?.sub) {
+
+                return (
+                    "google:" +
+                    sha256(payload.sub)
+                );
+            }
+
+        } catch (error) {
+
+            console.warn(
+                "ORRAX Google identity verification failed"
+            );
+        }
+    }
+
+
+    /*
+       ANONYMOUS USER
+    */
+
+    const browserId =
+        String(
+            req.headers[
+                "x-orrax-client-id"
+            ] || ""
+        ).trim();
+
+
+    const forwardedIp =
+        String(
+            req.headers[
+                "x-forwarded-for"
+            ] ||
+            req.headers[
+                "x-real-ip"
+            ] ||
+            req.socket?.remoteAddress ||
+            "unknown"
+        );
+
+
+    const ip =
+        forwardedIp
+            .split(",")[0]
+            .trim();
+
+
+    const stablePart =
+        browserId ||
+        "no-browser-id";
+
+
+    return (
+        "anon:" +
+        sha256(
+            `${stablePart}|${ip}`
+        )
+    );
+}
+
+
+/* =========================================================
+   MESSAGE BUILDER
+========================================================= */
+
+function buildMessages(
+    prompt,
+    history
+) {
+
+    const safeHistory =
+        Array.isArray(history)
+            ? history
+                .filter(item =>
+                    item &&
+                    (
+                        item.role === "user" ||
+                        item.role === "model"
+                    ) &&
+                    Array.isArray(item.parts) &&
+                    item.parts.some(
+                        part =>
+                            typeof part?.text === "string"
+                    )
+                )
+                .slice(-12)
+            : [];
+
+
+    const messages =
+        safeHistory
+            .map(item => {
+
+                const content =
+                    item.parts
+                        .filter(
+                            part =>
+                                typeof part?.text ===
+                                "string"
+                        )
+                        .map(
+                            part =>
+                                part.text
+                        )
+                        .join("\n")
+                        .trim();
+
+
+                return {
+                    role:
+                        item.role === "model"
+                            ? "assistant"
+                            : "user",
+
+                    content
+                };
+            })
+            .filter(
+                item =>
+                    item.content
+            );
+
+
+    messages.push({
+        role: "user",
+        content: prompt.trim()
+    });
+
+
+    return messages;
+}
+
+
+/* =========================================================
+   GEMINI TRANSCRIPT
+========================================================= */
+
+function buildTranscript(
+    prompt,
+    history
+) {
+
+    return buildMessages(
+        prompt,
+        history
+    )
+        .map(item =>
+            `${
+                item.role === "assistant"
+                    ? "ORRAX"
+                    : "USER"
+            }: ${item.content}`
+        )
+        .join("\n\n");
+}
+
+
+/* =========================================================
+   RESPONSE EXTRACTORS
+========================================================= */
+
+function extractOpenAIText(data) {
+
+    return (
+        data?.choices?.[0]?.message?.content
+            ?.trim() ||
+        ""
+    );
+}
+
+
+function extractGeminiText(data) {
+
+    if (
+        typeof data?.output_text ===
+        "string" &&
         data.output_text.trim()
     ) {
+
         return data.output_text.trim();
     }
 
-    const steps = Array.isArray(data?.steps)
-        ? data.steps
-        : [];
+
+    const steps =
+        Array.isArray(data?.steps)
+            ? data.steps
+            : [];
+
 
     return steps
-        .filter(step =>
-            step?.type === "model_output" &&
-            Array.isArray(step?.content)
-        )
-        .flatMap(step => step.content)
         .filter(
-            part => typeof part?.text === "string"
+            step =>
+                step?.type ===
+                    "model_output" &&
+                Array.isArray(
+                    step?.content
+                )
         )
-        .map(part => part.text)
+        .flatMap(
+            step =>
+                step.content
+        )
+        .filter(
+            part =>
+                typeof part?.text ===
+                "string"
+        )
+        .map(
+            part =>
+                part.text
+        )
         .join("")
         .trim();
 }
 
-function isTemporaryError(status) {
-    return (
-        status === 408 ||
-        status === 429 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504
+
+/* =========================================================
+   RETRYABLE STATUS
+========================================================= */
+
+function retryable(status) {
+
+    return [
+        408,
+        409,
+        425,
+        429,
+        500,
+        502,
+        503,
+        504
+    ].includes(
+        Number(status)
     );
 }
 
-async function callModel(model, input) {
-    const maxAttempts = 2;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+/* =========================================================
+   GENERIC FETCH WITH BACKOFF
+========================================================= */
+
+async function fetchJson(
+    url,
+    options,
+    attempts = 2
+) {
+
+    let lastError = null;
+
+
+    for (
+        let attempt = 0;
+        attempt < attempts;
+        attempt++
+    ) {
+
         try {
-            const response = await fetch(
-                "https://generativelanguage.googleapis.com/v1beta/interactions",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": API_KEY
-                    },
-                    body: JSON.stringify({
-                        model,
-                        input,
-                        system_instruction: SYSTEM_INSTRUCTION,
-                        generation_config: {
-                            thinking_level: "low"
-                        },
-                        store: false
-                    })
-                }
-            );
+
+            const response =
+                await fetch(
+                    url,
+                    options
+                );
+
 
             const data =
-                await response.json().catch(() => ({}));
+                await response
+                    .json()
+                    .catch(
+                        () => ({})
+                    );
+
 
             if (response.ok) {
+
                 return {
-                    ok: true,
+                    response,
                     data
                 };
             }
 
-            const message =
-                data?.error?.message ||
-                `Gemini returned HTTP ${response.status}`;
+
+            const error =
+                new Error(
+                    data?.error?.message ||
+                    data?.error ||
+                    `HTTP ${response.status}`
+                );
+
+
+            error.status =
+                response.status;
+
+
+            error.data =
+                data;
+
 
             if (
-                !isTemporaryError(response.status) ||
-                attempt === maxAttempts - 1
+                !retryable(
+                    response.status
+                ) ||
+                attempt ===
+                    attempts - 1
             ) {
-                return {
-                    ok: false,
-                    status: response.status,
-                    message
-                };
+
+                throw error;
             }
 
-            // Exponential backoff:
-            // 1.2s → 2.4s
-            const delay =
-                1200 * Math.pow(2, attempt);
 
-            await sleep(delay);
+            const retryAfter =
+                Number(
+                    response.headers.get(
+                        "retry-after"
+                    )
+                );
+
+
+            const waitMs =
+                Number.isFinite(
+                    retryAfter
+                ) &&
+                retryAfter > 0
+
+                    ? Math.min(
+                        retryAfter * 1000,
+                        5000
+                    )
+
+                    : 500 *
+                      2 ** attempt;
+
+
+            await new Promise(
+                resolve =>
+                    setTimeout(
+                        resolve,
+                        waitMs
+                    )
+            );
+
+
+            lastError =
+                error;
 
         } catch (error) {
-            if (attempt === maxAttempts - 1) {
-                return {
-                    ok: false,
-                    status: 503,
-                    message:
-                        error?.message ||
-                        "Temporary network error."
-                };
+
+            lastError =
+                error;
+
+
+            if (
+                attempt ===
+                    attempts - 1 ||
+                !retryable(
+                    error?.status
+                )
+            ) {
+
+                throw error;
             }
 
-            await sleep(
-                1200 * Math.pow(2, attempt)
+
+            await new Promise(
+                resolve =>
+                    setTimeout(
+                        resolve,
+                        500 *
+                        2 ** attempt
+                    )
             );
         }
     }
 
-    return {
-        ok: false,
-        status: 503,
-        message: "Temporary Gemini service error."
-    };
+
+    throw (
+        lastError ||
+        new Error(
+            "Provider failed"
+        )
+    );
 }
 
-export default async function handler(req, res) {
+
+/* =========================================================
+   GEMINI
+========================================================= */
+
+async function callGemini(
+    prompt,
+    history
+) {
+
+    if (!GEMINI_API_KEY) {
+
+        throw new Error(
+            "NO_GEMINI_KEY"
+        );
+    }
+
+
+    const {
+        data
+    } = await fetchJson(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                "x-goog-api-key":
+                    GEMINI_API_KEY
+            },
+
+            body:
+                JSON.stringify({
+
+                    model:
+                        GEMINI_MODEL,
+
+                    input:
+                        buildTranscript(
+                            prompt,
+                            history
+                        ),
+
+                    system_instruction:
+                        SYSTEM_INSTRUCTION,
+
+                    generation_config: {
+                        thinking_level:
+                            "low"
+                    },
+
+                    store:
+                        false
+                })
+        },
+        2
+    );
+
+
+    const text =
+        extractGeminiText(
+            data
+        );
+
+
+    if (!text) {
+
+        throw new Error(
+            "EMPTY_GEMINI_RESPONSE"
+        );
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+   XKIRO MODEL DISCOVERY
+========================================================= */
+
+async function getXKiroModel(key) {
+
+    if (XKIRO_MODEL) {
+
+        return XKIRO_MODEL;
+    }
+
+
+    const response =
+        await fetch(
+            "https://api.xkiro.com/v1/models",
+            {
+                headers: {
+                    Authorization:
+                        `Bearer ${key}`
+                }
+            }
+        );
+
+
+    if (!response.ok) {
+
+        throw new Error(
+            `XKIRO_MODELS_${response.status}`
+        );
+    }
+
+
+    const catalog =
+        await response.json();
+
+
+    const models =
+        Array.isArray(
+            catalog?.data
+        )
+            ? catalog.data
+            : [];
+
+
+    /*
+       Prefer an actually free model.
+    */
+
+    const freeModels =
+        models.filter(
+            model =>
+                model?.access_tier ===
+                "free"
+        );
+
+
+    if (freeModels.length) {
+
+        return freeModels[0].id;
+    }
+
+
+    /*
+       If catalog does not expose
+       access_tier, use first model.
+    */
+
+    const fallback =
+        models.find(
+            model =>
+                model?.id
+        );
+
+
+    if (!fallback?.id) {
+
+        throw new Error(
+            "NO_XKIRO_MODEL"
+        );
+    }
+
+
+    return fallback.id;
+}
+
+
+/* =========================================================
+   XKIRO
+========================================================= */
+
+async function callXKiro(
+    key,
+    prompt,
+    history
+) {
+
+    if (!key) {
+
+        throw new Error(
+            "NO_XKIRO_KEY"
+        );
+    }
+
+
+    const model =
+        await getXKiroModel(
+            key
+        );
+
+
+    const {
+        data
+    } = await fetchJson(
+        "https://api.xkiro.com/v1/chat/completions",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                Authorization:
+                    `Bearer ${key}`
+            },
+
+            body:
+                JSON.stringify({
+
+                    model,
+
+                    messages: [
+                        {
+                            role:
+                                "system",
+
+                            content:
+                                SYSTEM_INSTRUCTION
+                        },
+
+                        ...buildMessages(
+                            prompt,
+                            history
+                        )
+                    ],
+
+                    max_tokens:
+                        900,
+
+                    temperature:
+                        0.6
+                })
+        },
+        2
+    );
+
+
+    const text =
+        extractOpenAIText(
+            data
+        );
+
+
+    if (!text) {
+
+        throw new Error(
+            "EMPTY_XKIRO_RESPONSE"
+        );
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+   DAHL
+========================================================= */
+
+async function callDahl(
+    prompt,
+    history
+) {
+
+    if (!DAHL_API_KEY) {
+
+        throw new Error(
+            "NO_DAHL_KEY"
+        );
+    }
+
+
+    const {
+        data
+    } = await fetchJson(
+        "https://inference.dahl.global/v1/chat/completions",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                Authorization:
+                    `Bearer ${DAHL_API_KEY}`
+            },
+
+            body:
+                JSON.stringify({
+
+                    model:
+                        DAHL_MODEL,
+
+                    messages: [
+                        {
+                            role:
+                                "system",
+
+                            content:
+                                SYSTEM_INSTRUCTION
+                        },
+
+                        ...buildMessages(
+                            prompt,
+                            history
+                        )
+                    ],
+
+                    max_tokens:
+                        900,
+
+                    temperature:
+                        0.6
+                })
+        },
+        2
+    );
+
+
+    const text =
+        extractOpenAIText(
+            data
+        );
+
+
+    if (!text) {
+
+        throw new Error(
+            "EMPTY_DAHL_RESPONSE"
+        );
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+   OPENROUTER FREE
+========================================================= */
+
+async function callOpenRouter(
+    prompt,
+    history
+) {
+
+    if (!OPENROUTER_API_KEY) {
+
+        throw new Error(
+            "NO_OPENROUTER_KEY"
+        );
+    }
+
+
+    const {
+        data
+    } = await fetchJson(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                Authorization:
+                    `Bearer ${OPENROUTER_API_KEY}`,
+
+                "HTTP-Referer":
+                    "https://zane-beep.github.io/ORRAX",
+
+                "X-Title":
+                    "ORRAX"
+            },
+
+            body:
+                JSON.stringify({
+
+                    model:
+                        "openrouter/free",
+
+                    messages: [
+                        {
+                            role:
+                                "system",
+
+                            content:
+                                SYSTEM_INSTRUCTION
+                        },
+
+                        ...buildMessages(
+                            prompt,
+                            history
+                        )
+                    ],
+
+                    max_tokens:
+                        900,
+
+                    temperature:
+                        0.6
+                })
+        },
+        2
+    );
+
+
+    const text =
+        extractOpenAIText(
+            data
+        );
+
+
+    if (!text) {
+
+        throw new Error(
+            "EMPTY_OPENROUTER_RESPONSE"
+        );
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+   GROQ
+========================================================= */
+
+async function callGroq(
+    prompt,
+    history
+) {
+
+    if (!GROQ_API_KEY) {
+
+        throw new Error(
+            "NO_GROQ_KEY"
+        );
+    }
+
+
+    const {
+        data
+    } = await fetchJson(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json",
+
+                Authorization:
+                    `Bearer ${GROQ_API_KEY}`
+            },
+
+            body:
+                JSON.stringify({
+
+                    model:
+                        GROQ_MODEL,
+
+                    messages: [
+                        {
+                            role:
+                                "system",
+
+                            content:
+                                SYSTEM_INSTRUCTION
+                        },
+
+                        ...buildMessages(
+                            prompt,
+                            history
+                        )
+                    ],
+
+                    max_tokens:
+                        900,
+
+                    temperature:
+                        0.6
+                })
+        },
+        2
+    );
+
+
+    const text =
+        extractOpenAIText(
+            data
+        );
+
+
+    if (!text) {
+
+        throw new Error(
+            "EMPTY_GROQ_RESPONSE"
+        );
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+   MAIN HANDLER
+========================================================= */
+
+export default async function handler(
+    req,
+    res
+) {
+
+    /*
+       CORS
+    */
 
     const origin =
         req.headers.origin || "";
 
-    Object.entries(
-        corsHeaders(origin)
-    ).forEach(([key, value]) => {
-        res.setHeader(key, value);
-    });
 
-    if (req.method === "OPTIONS") {
-        return res.status(204).end();
+    for (
+        const [
+            key,
+            value
+        ] of Object.entries(
+            corsHeaders(origin)
+        )
+    ) {
+
+        res.setHeader(
+            key,
+            value
+        );
     }
 
-    if (req.method !== "POST") {
-        return res.status(405).json({
-            error: "Method not allowed."
-        });
+
+    /*
+       OPTIONS
+    */
+
+    if (
+        req.method ===
+        "OPTIONS"
+    ) {
+
+        return res
+            .status(204)
+            .end();
     }
 
-    if (!API_KEY) {
-        return res.status(500).json({
-            error:
-                "GEMINI_API_KEY is not configured on the server."
-        });
+
+    /*
+       POST ONLY
+    */
+
+    if (
+        req.method !==
+        "POST"
+    ) {
+
+        return res
+            .status(405)
+            .json({
+                error:
+                    "Method not allowed."
+            });
     }
 
-    try {
 
-        const {
-            prompt,
-            history
-        } = req.body || {};
+    /*
+       INPUT
+    */
 
-        if (
-            typeof prompt !== "string" ||
-            !prompt.trim()
-        ) {
-            return res.status(400).json({
+    const {
+        prompt,
+        history
+    } =
+        req.body || {};
+
+
+    if (
+        typeof prompt !==
+            "string" ||
+        !prompt.trim()
+    ) {
+
+        return res
+            .status(400)
+            .json({
                 error:
                     "A valid prompt is required."
             });
-        }
+    }
 
-        const input =
-            buildInput(
-                prompt,
-                history
+
+    let reservation =
+        null;
+
+
+    try {
+
+        /*
+           IDENTIFY USER
+        */
+
+        const userKey =
+            await identifyUser(
+                req
             );
 
-        let lastError = null;
 
-        // =========================================
-        // MODEL FALLBACK CHAIN
-        // 3.8 → 3.7 → 3.6 → 3.5 Flash-Lite
-        // =========================================
+        /*
+           RESERVE ONE DAILY SLOT
+        */
 
-        for (const model of MODELS) {
+        reservation =
+            await reserveDailyReply(
+                userKey
+            );
 
-            const result =
-                await callModel(
-                    model,
-                    input
-                );
 
-            if (result.ok) {
+        /*
+           USER HAS USED 26 REPLIES
+        */
+
+        if (
+            !reservation.allowed
+        ) {
+
+            return res
+                .status(429)
+                .json({
+                    code:
+                        "DAILY_LIMIT",
+
+                    error:
+                        "FREE_DAILY_LIMIT"
+                });
+        }
+
+
+        /*
+           PROVIDER FALLBACK CHAIN
+
+           xKiro #1 and #2 are NOT
+           treated as separate quotas.
+        */
+
+        const providers = [
+
+            [
+                "gemini",
+
+                () =>
+                    callGemini(
+                        prompt,
+                        history
+                    )
+            ],
+
+            [
+                "xkiro-1",
+
+                () =>
+                    callXKiro(
+                        XKIRO_KEY_1,
+                        prompt,
+                        history
+                    )
+            ],
+
+            [
+                "xkiro-2",
+
+                () =>
+                    callXKiro(
+                        XKIRO_KEY_2,
+                        prompt,
+                        history
+                    )
+            ],
+
+            [
+                "dahl",
+
+                () =>
+                    callDahl(
+                        prompt,
+                        history
+                    )
+            ],
+
+            [
+                "openrouter",
+
+                () =>
+                    callOpenRouter(
+                        prompt,
+                        history
+                    )
+            ]
+        ];
+
+
+        /*
+           OPTIONAL GROQ
+
+           Only enabled manually.
+        */
+
+        if (
+            ENABLE_PAID_FALLBACKS
+        ) {
+
+            providers.push([
+                "groq",
+
+                () =>
+                    callGroq(
+                        prompt,
+                        history
+                    )
+            ]);
+        }
+
+
+        /*
+           TRY PROVIDERS ONE BY ONE
+        */
+
+        for (
+            const [
+                name,
+                call
+            ] of providers
+        ) {
+
+            try {
 
                 const text =
-                    extractText(
-                        result.data
-                    );
+                    await call();
 
-                if (text) {
 
-                    console.log(
-                        `ORRAX response generated by ${model}`
-                    );
-
-                    return res.status(200).json({
-                        text
-                    });
-                }
-
-                lastError = {
-                    status: 502,
-                    message:
-                        `${model} returned no text.`
-                };
-
-            } else {
-
-                console.warn(
-                    `ORRAX model ${model} failed:`,
-                    result.message
+                console.info(
+                    `ORRAX provider success: ${name}`
                 );
 
-                lastError = result;
+
+                /*
+                   SUCCESS:
+                   The reserved slot stays consumed.
+                */
+
+                return res
+                    .status(200)
+                    .json({
+                        text
+                    });
+
+            } catch (error) {
+
+                /*
+                   Never expose provider
+                   errors to the user.
+                */
+
+                console.warn(
+                    `ORRAX provider failed: ${name}`,
+                    error?.status ||
+                    error?.message ||
+                    "unknown"
+                );
             }
         }
 
-        // =========================================
-        // ALL MODELS FAILED
-        // =========================================
 
-        return res.status(
-            lastError?.status || 503
-        ).json({
-            error:
-                "The ORRAX neural network is temporarily busy. Please try again in a moment."
-        });
+        /*
+           EVERY PROVIDER FAILED.
+
+           Give the daily slot back.
+        */
+
+        await releaseDailyReply(
+            reservation.key
+        );
+
+        reservation =
+            null;
+
+
+        return res
+            .status(503)
+            .json({
+                code:
+                    "TEMPORARILY_UNAVAILABLE",
+
+                error:
+                    "AI_TEMPORARILY_UNAVAILABLE"
+            });
+
 
     } catch (error) {
 
         console.error(
-            "ORRAX chat error:",
+            "ORRAX chat route error:",
+            error?.message ||
             error
         );
 
-        return res.status(500).json({
-            error:
-                "The ORRAX neural link could not complete the request."
-        });
+
+        /*
+           Do not consume quota when
+           no successful reply happened.
+        */
+
+        if (
+            reservation?.key
+        ) {
+
+            await releaseDailyReply(
+                reservation.key
+            );
+        }
+
+
+        return res
+            .status(503)
+            .json({
+                code:
+                    "TEMPORARILY_UNAVAILABLE",
+
+                error:
+                    "AI_TEMPORARILY_UNAVAILABLE"
+            });
     }
 }
