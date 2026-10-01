@@ -1,5 +1,9 @@
-const PRIMARY_MODEL = "gemini-3.8-flash";
-const FALLBACK_MODEL = "gemini-3.7-flash";
+const MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite"
+];
 
 const API_KEY = process.env.GEMINI_API_KEY;
 
@@ -48,6 +52,10 @@ function corsHeaders(origin = "") {
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
         "Vary": "Origin"
     };
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function buildInput(prompt, history) {
@@ -127,8 +135,9 @@ function extractText(data) {
         .trim();
 }
 
-function shouldRetry(status) {
+function isTemporaryError(status) {
     return (
+        status === 408 ||
         status === 429 ||
         status === 500 ||
         status === 502 ||
@@ -137,77 +146,91 @@ function shouldRetry(status) {
     );
 }
 
-function sleep(ms) {
-    return new Promise(resolve =>
-        setTimeout(resolve, ms)
-    );
-}
-
-async function callGemini(model, input) {
-    const maxAttempts = 3;
-
-    let lastStatus = 500;
-    let lastMessage = "";
+async function callModel(model, input) {
+    const maxAttempts = 2;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const response = await fetch(
-            "https://generativelanguage.googleapis.com/v1beta/interactions",
-            {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": API_KEY
-                },
-                body: JSON.stringify({
-                    model,
-                    input,
-                    system_instruction: SYSTEM_INSTRUCTION,
-                    generation_config: {
-                        thinking_level: "low"
+        try {
+            const response = await fetch(
+                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": API_KEY
                     },
-                    store: false
-                })
+                    body: JSON.stringify({
+                        model,
+                        input,
+                        system_instruction: SYSTEM_INSTRUCTION,
+                        generation_config: {
+                            thinking_level: "low"
+                        },
+                        store: false
+                    })
+                }
+            );
+
+            const data =
+                await response.json().catch(() => ({}));
+
+            if (response.ok) {
+                return {
+                    ok: true,
+                    data
+                };
             }
-        );
 
-        const data = await response.json().catch(() => ({}));
+            const message =
+                data?.error?.message ||
+                `Gemini returned HTTP ${response.status}`;
 
-        if (response.ok) {
-            return {
-                ok: true,
-                data
-            };
-        }
+            if (
+                !isTemporaryError(response.status) ||
+                attempt === maxAttempts - 1
+            ) {
+                return {
+                    ok: false,
+                    status: response.status,
+                    message
+                };
+            }
 
-        lastStatus = response.status;
+            // Exponential backoff:
+            // 1.2s → 2.4s
+            const delay =
+                1200 * Math.pow(2, attempt);
 
-        lastMessage =
-            data?.error?.message ||
-            `Gemini returned HTTP ${response.status}`;
-
-        if (!shouldRetry(response.status)) {
-            return {
-                ok: false,
-                status: response.status,
-                message: lastMessage
-            };
-        }
-
-        if (attempt < maxAttempts - 1) {
-            const delay = 1000 * Math.pow(2, attempt);
             await sleep(delay);
+
+        } catch (error) {
+            if (attempt === maxAttempts - 1) {
+                return {
+                    ok: false,
+                    status: 503,
+                    message:
+                        error?.message ||
+                        "Temporary network error."
+                };
+            }
+
+            await sleep(
+                1200 * Math.pow(2, attempt)
+            );
         }
     }
 
     return {
         ok: false,
-        status: lastStatus,
-        message: lastMessage
+        status: 503,
+        message: "Temporary Gemini service error."
     };
 }
 
 export default async function handler(req, res) {
-    const origin = req.headers.origin || "";
+
+    const origin =
+        req.headers.origin || "";
 
     Object.entries(
         corsHeaders(origin)
@@ -233,6 +256,7 @@ export default async function handler(req, res) {
     }
 
     try {
+
         const {
             prompt,
             history
@@ -248,63 +272,75 @@ export default async function handler(req, res) {
             });
         }
 
-        const input = buildInput(
-            prompt,
-            history
-        );
-
-        // ==========================================
-        // PRIMARY MODEL
-        // Gemini 3.8 Flash
-        // ==========================================
-
-        let result = await callGemini(
-            PRIMARY_MODEL,
-            input
-        );
-
-        // ==========================================
-        // FALLBACK MODEL
-        // Gemini 3.7 Flash
-        // ==========================================
-
-        if (!result.ok) {
-            console.warn(
-                `${PRIMARY_MODEL} failed:`,
-                result.message
+        const input =
+            buildInput(
+                prompt,
+                history
             );
 
-            result = await callGemini(
-                FALLBACK_MODEL,
-                input
-            );
+        let lastError = null;
+
+        // =========================================
+        // MODEL FALLBACK CHAIN
+        // 3.8 → 3.7 → 3.6 → 3.5 Flash-Lite
+        // =========================================
+
+        for (const model of MODELS) {
+
+            const result =
+                await callModel(
+                    model,
+                    input
+                );
+
+            if (result.ok) {
+
+                const text =
+                    extractText(
+                        result.data
+                    );
+
+                if (text) {
+
+                    console.log(
+                        `ORRAX response generated by ${model}`
+                    );
+
+                    return res.status(200).json({
+                        text
+                    });
+                }
+
+                lastError = {
+                    status: 502,
+                    message:
+                        `${model} returned no text.`
+                };
+
+            } else {
+
+                console.warn(
+                    `ORRAX model ${model} failed:`,
+                    result.message
+                );
+
+                lastError = result;
+            }
         }
 
-        if (!result.ok) {
-            return res.status(
-                result.status || 503
-            ).json({
-                error:
-                    "ORRAX neural link is temporarily busy. Please try again in a moment."
-            });
-        }
+        // =========================================
+        // ALL MODELS FAILED
+        // =========================================
 
-        const text = extractText(
-            result.data
-        );
-
-        if (!text) {
-            return res.status(502).json({
-                error:
-                    "Gemini returned no text response."
-            });
-        }
-
-        return res.status(200).json({
-            text
+        return res.status(
+            lastError?.status || 503
+        ).json({
+            error:
+                "The ORRAX neural network is temporarily busy. Please try again in a moment."
         });
 
     } catch (error) {
+
         console.error(
             "ORRAX chat error:",
             error
