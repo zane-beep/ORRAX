@@ -1,0 +1,8 @@
+{
+  "name": "orrax",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "google-auth-library": "^10.5.0"
+  }
+}
