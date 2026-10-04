@@ -2,6 +2,7 @@
  * Server-only AI router.
  * - 26 successful text replies per user per UTC day.
  * - Google users are identified by verified Google ID-token `sub`.
+ * - Google redirect sessions are identified by secure Redis-backed cookie.
  * - Anonymous users use a server-scoped browser id + IP hash.
  * - Gemini -> xKiro key 1 -> xKiro key 2 -> Dahl -> OpenRouter free -> optional paid fallbacks.
  * - Technical provider errors are never returned to the browser.
@@ -11,12 +12,26 @@ import crypto from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 
 const DAILY_LIMIT = 26;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-3.8-flash";
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const DAHL_API_KEY = process.env.DAHL_API_KEY || "";
+
+const GOOGLE_CLIENT_ID =
+  process.env.GOOGLE_CLIENT_ID || "";
+
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY || "";
+
+const GEMINI_MODEL =
+  process.env.GEMINI_TEXT_MODEL ||
+  "gemini-3.8-flash";
+
+const OPENROUTER_API_KEY =
+  process.env.OPENROUTER_API_KEY || "";
+
+const GROQ_API_KEY =
+  process.env.GROQ_API_KEY || "";
+
+const DAHL_API_KEY =
+  process.env.DAHL_API_KEY || "";
+
 const XKIRO_KEYS = [
   process.env.XKIRO_API_KEY,
   process.env.XKIRO_API_KEY_2
@@ -24,6 +39,7 @@ const XKIRO_KEYS = [
 
 const ENABLE_PAID_FALLBACKS =
   process.env.ENABLE_PAID_FALLBACKS === "true";
+
 
 const SYSTEM_INSTRUCTION = `
 You are ORRAX, created by KHAN SAHEB.
@@ -45,13 +61,20 @@ STYLE:
 - Never claim to have used a tool or capability you did not actually use.
 `;
 
+
+/* =========================================================
+   CORS
+========================================================= */
+
 function corsHeaders(origin = "") {
+
   const allowed = new Set([
     "https://zane-beep.github.io",
     "https://orrax.vercel.app"
   ]);
 
   return {
+
     "Access-Control-Allow-Origin":
       allowed.has(origin)
         ? origin
@@ -63,12 +86,24 @@ function corsHeaders(origin = "") {
     "Access-Control-Allow-Headers":
       "Content-Type, Authorization, X-ORRAX-CLIENT-ID",
 
-    "Vary": "Origin",
-    "Cache-Control": "no-store"
+    "Access-Control-Allow-Credentials":
+      "true",
+
+    "Vary":
+      "Origin",
+
+    "Cache-Control":
+      "no-store"
   };
 }
 
+
+/* =========================================================
+   HASH
+========================================================= */
+
 function sha256(value) {
+
   return crypto
     .createHash("sha256")
     .update(String(value))
@@ -95,21 +130,31 @@ function getRedisConfig() {
     "";
 
   return {
-    url: url.replace(/\/+$/, ""),
+
+    url:
+      url.replace(/\/+$/, ""),
+
     token
   };
 }
 
 
-async function redisCommand(command, args = []) {
+async function redisCommand(
+  command,
+  args = []
+) {
 
   const {
     url,
     token
-  } = getRedisConfig();
+  } =
+    getRedisConfig();
 
   if (!url || !token) {
-    throw new Error("REDIS_NOT_CONFIGURED");
+
+    throw new Error(
+      "REDIS_NOT_CONFIGURED"
+    );
   }
 
   const path = [
@@ -117,22 +162,28 @@ async function redisCommand(command, args = []) {
     ...args
   ]
     .map(v =>
-      encodeURIComponent(String(v))
+      encodeURIComponent(
+        String(v)
+      )
     )
     .join("/");
 
-  const response = await fetch(
-    `${url}/${path}`,
-    {
-      method: "POST",
-      headers: {
-        Authorization:
-          `Bearer ${token}`
+  const response =
+    await fetch(
+      `${url}/${path}`,
+      {
+        method:
+          "POST",
+
+        headers: {
+          Authorization:
+            `Bearer ${token}`
+        }
       }
-    }
-  );
+    );
 
   if (!response.ok) {
+
     throw new Error(
       `REDIS_HTTP_${response.status}`
     );
@@ -153,7 +204,9 @@ function utcDayKey() {
 }
 
 
-async function reserveDailyReply(userKey) {
+async function reserveDailyReply(
+  userKey
+) {
 
   const key =
     `orrax:daily:${utcDayKey()}:${userKey}`;
@@ -183,7 +236,8 @@ async function reserveDailyReply(userKey) {
       [
         key,
         Math.floor(
-          tomorrow.getTime() / 1000
+          tomorrow.getTime() /
+          1000
         )
       ]
     );
@@ -197,21 +251,32 @@ async function reserveDailyReply(userKey) {
     ).catch(() => {});
 
     return {
-      allowed: false,
+
+      allowed:
+        false,
+
       key,
-      count: DAILY_LIMIT
+
+      count:
+        DAILY_LIMIT
     };
   }
 
   return {
-    allowed: true,
+
+    allowed:
+      true,
+
     key,
+
     count
   };
 }
 
 
-async function releaseDailyReply(key) {
+async function releaseDailyReply(
+  key
+) {
 
   await redisCommand(
     "decr",
@@ -225,6 +290,67 @@ async function releaseDailyReply(key) {
 ========================================================= */
 
 async function identifyUser(req) {
+
+  /* =====================================================
+     GOOGLE REDIRECT SESSION COOKIE
+  ===================================================== */
+
+  const cookieHeader =
+    String(
+      req.headers.cookie || ""
+    );
+
+  const sessionMatch =
+    cookieHeader.match(
+      /(?:^|;\s*)orrax_session=([^;]+)/
+    );
+
+  const sessionToken =
+    sessionMatch
+      ? decodeURIComponent(
+          sessionMatch[1]
+        )
+      : "";
+
+  if (sessionToken) {
+
+    try {
+
+      const rawSession =
+        await redisCommand(
+          "get",
+          [
+            `orrax:session:${sessionToken}`
+          ]
+        );
+
+      if (rawSession) {
+
+        const session =
+          typeof rawSession === "string"
+            ? JSON.parse(rawSession)
+            : rawSession;
+
+        if (session?.sub) {
+
+          return `google:${sha256(
+            session.sub
+          )}`;
+        }
+      }
+
+    } catch (error) {
+
+      console.warn(
+        "ORRAX session verification failed"
+      );
+    }
+  }
+
+
+  /* =====================================================
+     EXISTING GOOGLE BEARER TOKEN
+  ===================================================== */
 
   const auth =
     String(
@@ -250,8 +376,13 @@ async function identifyUser(req) {
 
       const ticket =
         await client.verifyIdToken({
-          idToken: bearer,
-          audience: GOOGLE_CLIENT_ID
+
+          idToken:
+            bearer,
+
+          audience:
+            GOOGLE_CLIENT_ID
+
         });
 
       const payload =
@@ -272,6 +403,10 @@ async function identifyUser(req) {
     }
   }
 
+
+  /* =====================================================
+     ANONYMOUS USER
+  ===================================================== */
 
   const browserId =
     String(
@@ -337,6 +472,7 @@ function buildMessages(
   const messages =
     safeHistory
       .map(item => ({
+
         role:
           item.role === "model"
             ? "assistant"
@@ -355,6 +491,7 @@ function buildMessages(
             )
             .join("\n")
             .trim()
+
       }))
       .filter(
         item =>
@@ -362,8 +499,13 @@ function buildMessages(
       );
 
   messages.push({
-    role: "user",
-    content: prompt.trim()
+
+    role:
+      "user",
+
+    content:
+      prompt.trim()
+
   });
 
   return messages;
@@ -390,7 +532,9 @@ function buildTranscript(
 }
 
 
-function extractOpenAIText(data) {
+function extractOpenAIText(
+  data
+) {
 
   return (
     data
@@ -402,14 +546,19 @@ function extractOpenAIText(data) {
 }
 
 
-function extractGeminiText(data) {
+function extractGeminiText(
+  data
+) {
 
   if (
     typeof data?.output_text ===
       "string" &&
     data.output_text.trim()
   ) {
-    return data.output_text.trim();
+
+    return data
+      .output_text
+      .trim();
   }
 
   const steps =
@@ -451,6 +600,7 @@ function extractGeminiText(data) {
 function retryable(status) {
 
   return [
+
     408,
     409,
     425,
@@ -459,6 +609,7 @@ function retryable(status) {
     502,
     503,
     504
+
   ].includes(
     Number(status)
   );
@@ -471,7 +622,8 @@ async function fetchJson(
   attempts = 2
 ) {
 
-  let lastError = null;
+  let lastError =
+    null;
 
   for (
     let attempt = 0;
@@ -490,13 +642,18 @@ async function fetchJson(
       const data =
         await response
           .json()
-          .catch(() => ({}));
+          .catch(
+            () => ({})
+          );
 
       if (response.ok) {
 
         return {
+
           response,
+
           data
+
         };
       }
 
@@ -577,7 +734,7 @@ async function fetchJson(
           setTimeout(
             resolve,
             500 *
-              2 ** attempt
+            2 ** attempt
           )
       );
     }
@@ -602,6 +759,7 @@ async function callGemini(
 ) {
 
   if (!GEMINI_API_KEY) {
+
     throw new Error(
       "NO_GEMINI_KEY"
     );
@@ -609,39 +767,53 @@ async function callGemini(
 
   const { data } =
     await fetchJson(
+
       "https://generativelanguage.googleapis.com/v1beta/interactions",
+
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
           "x-goog-api-key":
             GEMINI_API_KEY
+
         },
 
-        body: JSON.stringify({
-          model:
-            GEMINI_MODEL,
+        body:
+          JSON.stringify({
 
-          input:
-            buildTranscript(
-              prompt,
-              history
-            ),
+            model:
+              GEMINI_MODEL,
 
-          system_instruction:
-            SYSTEM_INSTRUCTION,
+            input:
+              buildTranscript(
+                prompt,
+                history
+              ),
 
-          generation_config: {
-            thinking_level:
-              "low"
-          },
+            system_instruction:
+              SYSTEM_INSTRUCTION,
 
-          store: false
-        })
+            generation_config: {
+
+              thinking_level:
+                "low"
+
+            },
+
+            store:
+              false
+
+          })
+
       },
+
       2
     );
 
@@ -651,6 +823,7 @@ async function callGemini(
     );
 
   if (!text) {
+
     throw new Error(
       "EMPTY_GEMINI_RESPONSE"
     );
@@ -671,6 +844,7 @@ async function callXKiro(
 ) {
 
   if (!key) {
+
     throw new Error(
       "NO_XKIRO_KEY"
     );
@@ -686,10 +860,14 @@ async function callXKiro(
       await fetch(
         "https://api.xkiro.com/v1/models",
         {
+
           headers: {
+
             Authorization:
               `Bearer ${key}`
+
           }
+
         }
       );
 
@@ -735,37 +913,58 @@ async function callXKiro(
 
   const { data } =
     await fetchJson(
+
       "https://api.xkiro.com/v1/chat/completions",
+
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
           Authorization:
             `Bearer ${key}`
+
         },
 
-        body: JSON.stringify({
-          model,
+        body:
+          JSON.stringify({
 
-          messages: [
-            {
-              role: "system",
-              content:
-                SYSTEM_INSTRUCTION
-            },
-            ...buildMessages(
-              prompt,
-              history
-            )
-          ],
+            model,
 
-          max_tokens: 900,
-          temperature: 0.6
-        })
+            messages: [
+
+              {
+
+                role:
+                  "system",
+
+                content:
+                  SYSTEM_INSTRUCTION
+
+              },
+
+              ...buildMessages(
+                prompt,
+                history
+              )
+
+            ],
+
+            max_tokens:
+              900,
+
+            temperature:
+              0.6
+
+          })
+
       },
+
       2
     );
 
@@ -775,6 +974,7 @@ async function callXKiro(
     );
 
   if (!text) {
+
     throw new Error(
       "EMPTY_XKIRO_RESPONSE"
     );
@@ -806,38 +1006,58 @@ async function callDahl(
 
   const { data } =
     await fetchJson(
+
       "https://inference.dahl.global/v1/chat/completions",
+
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
           Authorization:
             `Bearer ${DAHL_API_KEY}`
+
         },
 
-        body: JSON.stringify({
-          model,
+        body:
+          JSON.stringify({
 
-          messages: [
-            {
-              role: "system",
-              content:
-                SYSTEM_INSTRUCTION
-            },
+            model,
 
-            ...buildMessages(
-              prompt,
-              history
-            )
-          ],
+            messages: [
 
-          max_tokens: 900,
-          temperature: 0.6
-        })
+              {
+
+                role:
+                  "system",
+
+                content:
+                  SYSTEM_INSTRUCTION
+
+              },
+
+              ...buildMessages(
+                prompt,
+                history
+              )
+
+            ],
+
+            max_tokens:
+              900,
+
+            temperature:
+              0.6
+
+          })
+
       },
+
       2
     );
 
@@ -875,11 +1095,16 @@ async function callOpenRouter(
 
   const { data } =
     await fetchJson(
+
       "https://openrouter.ai/api/v1/chat/completions",
+
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
@@ -891,29 +1116,44 @@ async function callOpenRouter(
 
           "X-Title":
             "ORRAX"
+
         },
 
-        body: JSON.stringify({
-          model:
-            "openrouter/free",
+        body:
+          JSON.stringify({
 
-          messages: [
-            {
-              role: "system",
-              content:
-                SYSTEM_INSTRUCTION
-            },
+            model:
+              "openrouter/free",
 
-            ...buildMessages(
-              prompt,
-              history
-            )
-          ],
+            messages: [
 
-          max_tokens: 900,
-          temperature: 0.6
-        })
+              {
+
+                role:
+                  "system",
+
+                content:
+                  SYSTEM_INSTRUCTION
+
+              },
+
+              ...buildMessages(
+                prompt,
+                history
+              )
+
+            ],
+
+            max_tokens:
+              900,
+
+            temperature:
+              0.6
+
+          })
+
       },
+
       2
     );
 
@@ -955,38 +1195,58 @@ async function callGroq(
 
   const { data } =
     await fetchJson(
+
       "https://api.groq.com/openai/v1/chat/completions",
+
       {
-        method: "POST",
+
+        method:
+          "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
           Authorization:
             `Bearer ${GROQ_API_KEY}`
+
         },
 
-        body: JSON.stringify({
-          model,
+        body:
+          JSON.stringify({
 
-          messages: [
-            {
-              role: "system",
-              content:
-                SYSTEM_INSTRUCTION
-            },
+            model,
 
-            ...buildMessages(
-              prompt,
-              history
-            )
-          ],
+            messages: [
 
-          max_tokens: 900,
-          temperature: 0.6
-        })
+              {
+
+                role:
+                  "system",
+
+                content:
+                  SYSTEM_INSTRUCTION
+
+              },
+
+              ...buildMessages(
+                prompt,
+                history
+              )
+
+            ],
+
+            max_tokens:
+              900,
+
+            temperature:
+              0.6
+
+          })
+
       },
+
       2
     );
 
@@ -1020,7 +1280,8 @@ export default async function handler(
     "";
 
   for (
-    const [key, value] of Object.entries(
+    const [key, value]
+    of Object.entries(
       corsHeaders(origin)
     )
   ) {
@@ -1031,6 +1292,10 @@ export default async function handler(
     );
   }
 
+
+  /* =====================================================
+     PREFLIGHT
+  ===================================================== */
 
   if (
     req.method ===
@@ -1043,6 +1308,10 @@ export default async function handler(
   }
 
 
+  /* =====================================================
+     METHOD
+  ===================================================== */
+
   if (
     req.method !==
     "POST"
@@ -1051,11 +1320,17 @@ export default async function handler(
     return res
       .status(405)
       .json({
+
         error:
           "Method not allowed."
+
       });
   }
 
+
+  /* =====================================================
+     BODY
+  ===================================================== */
 
   const {
     prompt,
@@ -1073,8 +1348,10 @@ export default async function handler(
     return res
       .status(400)
       .json({
+
         error:
           "A valid prompt is required."
+
       });
   }
 
@@ -1085,11 +1362,19 @@ export default async function handler(
 
   try {
 
+    /* ===================================================
+       IDENTIFY USER
+    =================================================== */
+
     const userKey =
       await identifyUser(
         req
       );
 
+
+    /* ===================================================
+       RESERVE DAILY SLOT
+    =================================================== */
 
     reservation =
       await reserveDailyReply(
@@ -1104,63 +1389,85 @@ export default async function handler(
       return res
         .status(429)
         .json({
+
           code:
             "DAILY_LIMIT",
 
           error:
             "FREE_DAILY_LIMIT"
+
         });
     }
 
 
+    /* ===================================================
+       PROVIDERS
+    =================================================== */
+
     const providers = [
 
       [
+
         "gemini",
+
         () =>
           callGemini(
             prompt,
             history
           )
+
       ],
 
       [
+
         "xkiro-1",
+
         () =>
           callXKiro(
             XKIRO_KEYS[0],
             prompt,
             history
           )
+
       ],
 
       [
+
         "xkiro-2",
+
         () =>
           callXKiro(
             XKIRO_KEYS[1],
             prompt,
             history
           )
+
       ],
 
       [
+
         "dahl",
+
         () =>
           callDahl(
             prompt,
             history
           )
+
       ],
 
       [
+
         "openrouter",
+
         () =>
           callOpenRouter(
             prompt,
             history
           )
+
       ]
+
     ];
 
 
@@ -1169,15 +1476,22 @@ export default async function handler(
     ) {
 
       providers.push([
+
         "groq",
+
         () =>
           callGroq(
             prompt,
             history
           )
+
       ]);
     }
 
+
+    /* ===================================================
+       PROVIDER LOOP
+    =================================================== */
 
     for (
       const [name, call]
@@ -1196,23 +1510,30 @@ export default async function handler(
         return res
           .status(200)
           .json({
+
             text
+
           });
 
       } catch (error) {
 
         console.warn(
+
           `ORRAX provider failed: ${name}`,
+
           error?.status ||
           error?.message ||
           "unknown"
+
         );
       }
     }
 
 
-    /* No provider replied.
-       Do not consume the user's daily slot. */
+    /* ===================================================
+       NO PROVIDER
+       DO NOT CONSUME DAILY SLOT
+    =================================================== */
 
     await releaseDailyReply(
       reservation.key
@@ -1225,20 +1546,25 @@ export default async function handler(
     return res
       .status(503)
       .json({
+
         code:
           "TEMPORARILY_UNAVAILABLE",
 
         error:
           "AI_TEMPORARILY_UNAVAILABLE"
+
       });
 
 
   } catch (error) {
 
     console.error(
+
       "ORRAX chat route error:",
+
       error?.message ||
       error
+
     );
 
 
@@ -1255,11 +1581,13 @@ export default async function handler(
     return res
       .status(503)
       .json({
+
         code:
           "TEMPORARILY_UNAVAILABLE",
 
         error:
           "AI_TEMPORARILY_UNAVAILABLE"
+
       });
   }
 }
