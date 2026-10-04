@@ -4,12 +4,21 @@ export default function handler(req, res) {
   const origin = req.headers.origin || "";
 
   if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      origin || "*"
+    );
+
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET, OPTIONS"
+    );
+
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type, Accept"
     );
+
     return res.status(204).end();
   }
 
@@ -25,9 +34,18 @@ export default function handler(req, res) {
     });
   }
 
+  const allowedOrigins = new Set([
+    "https://zane-beep.github.io",
+    "https://orrax.vercel.app"
+  ]);
+
+  const allowOrigin = allowedOrigins.has(origin)
+    ? origin
+    : "https://orrax.vercel.app";
+
   res.setHeader(
     "Access-Control-Allow-Origin",
-    origin || "https://orrax.vercel.app"
+    allowOrigin
   );
 
   res.setHeader("Vary", "Origin");
