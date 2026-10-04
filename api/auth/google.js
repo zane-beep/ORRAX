@@ -1,24 +1,40 @@
 import { OAuth2Client } from "google-auth-library";
 
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_ID =
+  process.env.GOOGLE_CLIENT_ID || "";
+
 const client = new OAuth2Client();
 
 function setCors(res, origin) {
-  const allowed = new Set([
+  const allowedOrigins = new Set([
     "https://orrax.vercel.app",
     "https://zane-beep.github.io"
   ]);
 
-  const allowOrigin = allowed.has(origin)
+  const allowOrigin = allowedOrigins.has(origin)
     ? origin
     : "https://orrax.vercel.app";
 
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    allowOrigin
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "POST, OPTIONS"
+  );
+
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, Accept, Authorization"
   );
+
+  res.setHeader(
+    "Access-Control-Allow-Credentials",
+    "true"
+  );
+
   res.setHeader("Vary", "Origin");
 }
 
@@ -74,8 +90,12 @@ export default async function handler(req, res) {
         picture: payload.picture || ""
       }
     });
+
   } catch (error) {
-    console.error("ORRAX Google auth error:", error);
+    console.error(
+      "ORRAX Google auth error:",
+      error
+    );
 
     return res.status(401).json({
       error: "Google sign-in could not be verified."
