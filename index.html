@@ -2,8 +2,71 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>ORRAX — Ultra-Luxury AI Intelligence</title>
+
+    <script>
+    /* =========================================================
+       ORRAX FRONTEND STABILITY GUARD
+       - Vercel stays backend-only; GitHub Pages is canonical UI.
+       - Instagram/Facebook in-app browsers get one cache-busting
+         fetch per tab so stale HTML is less likely to persist.
+    ========================================================= */
+    (function(){
+        try{
+            if(
+                location.hostname === "orrax.vercel.app" &&
+                !location.pathname.startsWith("/api/")
+            ){
+                location.replace("https://zane-beep.github.io/ORRAX/");
+                return;
+            }
+
+            const ua = navigator.userAgent || "";
+            const socialWebView = /Instagram|FBAN|FBAV|FBIOS|FB_IAB|Twitter for iPhone/i.test(ua);
+            const params = new URLSearchParams(location.search);
+            const CACHE_PARAM = "orraxv";
+            const CACHE_SESSION_KEY = "orrax_social_cache_bust_v1";
+
+            if(socialWebView && !params.has(CACHE_PARAM)){
+                let busted = false;
+                try{
+                    busted = sessionStorage.getItem(CACHE_SESSION_KEY) === "1";
+                }catch(e){}
+
+                if(!busted){
+                    try{
+                        sessionStorage.setItem(CACHE_SESSION_KEY,"1");
+                    }catch(e){}
+
+                    params.set(CACHE_PARAM,String(Date.now()));
+
+                    const next =
+                        location.pathname +
+                        "?" + params.toString() +
+                        location.hash;
+
+                    location.replace(next);
+                    return;
+                }
+            }
+
+            if(params.has(CACHE_PARAM)){
+                params.delete(CACHE_PARAM);
+
+                const clean =
+                    location.pathname +
+                    (params.toString() ? "?" + params.toString() : "") +
+                    location.hash;
+
+                history.replaceState({},document.title,clean);
+            }
+        }catch(e){}
+    })();
+    </script>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800;900&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -108,7 +171,10 @@
                 radial-gradient(circle at 50% 35%,rgba(var(--accent-rgb),.055),transparent 38%),
                 var(--bg-color);
             color:var(--text-main);
-            font-family:'Plus Jakarta Sans',sans-serif;
+            font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            -webkit-text-size-adjust:100%;
+            text-rendering:optimizeLegibility;
+            font-synthesis:none;
             height:100vh;
             overflow:hidden;
             display:flex;
@@ -1301,6 +1367,8 @@
     <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 
+<!-- ORRAX STABILITY BUILD: AUTH + CHAT + SOCIAL WEBVIEW + AUDIO -->
+
 <body data-theme="gold">
 
 <div id="custom-cursor"></div>
@@ -1862,11 +1930,132 @@ function getApiHeaders(){
 let requestInProgress = false;
 let currentSessionId = null;
 
-let chatSessions =
-    JSON.parse(localStorage.getItem("orrax_chat_sessions") || "[]");
-
 let googleCredential = null;
 let googleUser = null;
+
+/* Chat history is namespaced per verified Google subject.
+   Guest history keeps the old key and is migrated on first sign-in. */
+const ORRAX_GUEST_CHAT_KEY = "orrax_chat_sessions";
+let activeChatStorageKey = ORRAX_GUEST_CHAT_KEY;
+
+function getUserChatStorageKey(user){
+    const sub = String(user?.sub || "").trim();
+    return sub
+        ? `orrax_chat_sessions_user_${sub}`
+        : ORRAX_GUEST_CHAT_KEY;
+}
+
+function readChatSessions(key){
+    try{
+        const parsed = JSON.parse(
+            localStorage.getItem(key) || "[]"
+        );
+        return Array.isArray(parsed) ? parsed : [];
+    }catch(error){
+        return [];
+    }
+}
+
+function loadInitialChatSessions(){
+    try{
+        const savedUser = JSON.parse(
+            localStorage.getItem("orrax_google_user") || "null"
+        );
+
+        const userKey = getUserChatStorageKey(savedUser);
+
+        if(userKey !== ORRAX_GUEST_CHAT_KEY){
+            const userChats = readChatSessions(userKey);
+
+            if(userChats.length){
+                activeChatStorageKey = userKey;
+                return userChats;
+            }
+
+            const guestChats =
+                readChatSessions(ORRAX_GUEST_CHAT_KEY);
+
+            if(guestChats.length){
+                localStorage.setItem(
+                    userKey,
+                    JSON.stringify(guestChats)
+                );
+                activeChatStorageKey = userKey;
+                return guestChats;
+            }
+
+            activeChatStorageKey = userKey;
+            return [];
+        }
+    }catch(error){}
+
+    activeChatStorageKey = ORRAX_GUEST_CHAT_KEY;
+    return readChatSessions(ORRAX_GUEST_CHAT_KEY);
+}
+
+let chatSessions = loadInitialChatSessions();
+
+function switchChatStorageForUser(user){
+    const nextKey = getUserChatStorageKey(user);
+
+    if(nextKey === activeChatStorageKey){
+        return false;
+    }
+
+    const currentChats =
+        Array.isArray(chatSessions) ? chatSessions : [];
+
+    const existingUserChats =
+        readChatSessions(nextKey);
+
+    /* Preserve both sets when a visitor has guest chats and the
+       Google account already has its own history. */
+    if(existingUserChats.length && currentChats.length){
+        const byId = new Map(
+            existingUserChats.map(session=>[session.id,session])
+        );
+
+        currentChats.forEach(session=>{
+            if(!byId.has(session.id)){
+                byId.set(session.id,session);
+            }
+        });
+
+        chatSessions =
+            [...byId.values()].slice(-20);
+
+        localStorage.setItem(
+            nextKey,
+            JSON.stringify(chatSessions)
+        );
+    }else if(existingUserChats.length){
+        chatSessions = existingUserChats;
+    }else if(currentChats.length){
+        localStorage.setItem(
+            nextKey,
+            JSON.stringify(currentChats)
+        );
+        chatSessions = currentChats;
+    }else{
+        chatSessions = [];
+    }
+
+    activeChatStorageKey = nextKey;
+    currentSessionId = null;
+    return true;
+}
+
+function refreshActiveChatView(){
+    if(chatSessions.length){
+        currentSessionId =
+            chatSessions[chatSessions.length-1].id;
+        openChat(currentSessionId);
+    }else{
+        startNewChat(false);
+    }
+    renderHistory();
+}
+
 
 /* =========================================================
    INTRO
@@ -1925,7 +2114,7 @@ function startNewChat(save=true){
     }
 
     localStorage.setItem(
-        "orrax_chat_sessions",
+        activeChatStorageKey,
         JSON.stringify(chatSessions)
     );
 
@@ -1938,7 +2127,7 @@ function saveCurrentSession(){
     if(!currentSessionId) return;
 
     localStorage.setItem(
-        "orrax_chat_sessions",
+        activeChatStorageKey,
         JSON.stringify(chatSessions)
     );
 }
@@ -2643,7 +2832,7 @@ async function sendMessage(){
 
             appendMessage(
                 isBangla
-                    ? "আজকের ফ্রি ২৬টি রিপ্লাই শেষ হয়েছে। পেইড অ্যাক্সেস নিন অথবা আগামীকাল আবার চেষ্টা করুন।"
+                    ? "আজকের ফ্রি ২৬টি রিপ্লাই শেষ হয়েছে। পেইড অ্যাক্সেস নিন অথবা আগামীকাল আবার চেষ্টা করুন।"
                     : "Your 26 free replies for today are finished. Use paid access or try again tomorrow.",
                 "ai"
             );
@@ -3230,6 +3419,9 @@ async function startFallbackMusic(){
 
     fallbackAudio.preload =
         "auto";
+    fallbackAudio.playsInline = true;
+    fallbackAudio.setAttribute("playsinline", "");
+    fallbackAudio.setAttribute("webkit-playsinline", "");
 
     fallbackAudio.volume =
         0.18;
@@ -3992,6 +4184,13 @@ async function handleGoogleCredential(
         googleUser =
             data.user || null;
 
+        const switchedStorage =
+            switchChatStorageForUser(googleUser);
+
+        if(switchedStorage){
+            refreshActiveChatView();
+        }
+
         try {
             localStorage.setItem(
                 "orrax_google_user",
@@ -4101,7 +4300,7 @@ async function restoreGoogleSession(){
 
         const response =
             await fetch(
-                `${ORRAX_API_BASE}/api/auth/me`,
+                `${ORRAX_API_BASE}/api/me`,
                 {
                     method:"GET",
                     headers:{
@@ -4120,7 +4319,13 @@ async function restoreGoogleSession(){
             if(data?.user){
 
                 googleUser = data.user;
+                const switchedStorage =
+                    switchChatStorageForUser(googleUser);
                 applyGoogleUser();
+
+                if(switchedStorage){
+                    refreshActiveChatView();
+                }
 
                 try{
                     localStorage.setItem(
@@ -4167,7 +4372,13 @@ async function restoreGoogleSession(){
             googleCredential = savedCredential;
         }
 
+        const switchedStorage =
+            switchChatStorageForUser(googleUser);
         applyGoogleUser();
+
+        if(switchedStorage){
+            refreshActiveChatView();
+        }
 
     }catch(error){
         console.warn(
