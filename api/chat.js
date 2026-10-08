@@ -1,13 +1,15 @@
 /* ORRAX /api/chat
  * Server-only AI router.
  * - 26 successful text replies per user per UTC day.
- * - Google users are identified by verified Google ID-token `sub`.
+ * - Google users are identified by verified Google ID-token `sub` (or the orrax_session cookie).
  * - Anonymous users use a server-scoped browser id + IP hash.
  * - Gemini -> xKiro key 1 -> xKiro key 2 -> Dahl -> OpenRouter free -> optional paid fallbacks.
+ * - Attachments (image / pdf / audio / video via Gemini; text + docx/xlsx/pptx read as text for every provider).
  * - Technical provider errors are never returned to the browser.
  */
 
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { OAuth2Client } from "google-auth-library";
 
 const DAILY_LIMIT = 26;
@@ -25,10 +27,17 @@ const XKIRO_KEYS = [
 const ENABLE_PAID_FALLBACKS =
   process.env.ENABLE_PAID_FALLBACKS === "true";
 
+/* Attachment limits */
+const MAX_ATTACHMENTS = 3;
+const MAX_ATTACHMENT_BYTES = 12 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+const MAX_TEXT_CHARS_PER_FILE = 30000;
+const MAX_TEXT_CHARS_TOTAL = 60000;
+
 const SYSTEM_INSTRUCTION = `
 You are ORRAX, created by KHAN SAHEB.
 
-LANGUAGE RULE â STRICT:
+LANGUAGE RULE - STRICT:
 1. Reply entirely in the language used by the user.
 2. Bengali input -> Bengali response.
 3. English input -> English response.
@@ -40,10 +49,16 @@ STYLE:
 - Be accurate, helpful and concise.
 - Prefer short, useful answers unless the user asks for depth.
 - Do not pad answers with repeated explanations.
-- For code, provide complete working code when requested.
-- Never reveal server keys, internal routing, quota implementation, or provider errors.
+- Do not repeat the same point twice.
+- Write normal replies as clean, natural plain prose.
+- Do not use Markdown decoration in normal prose: no asterisks for bold or italics, no # headings, no underscores or ~~ for emphasis, no decorative bullet symbols.
+- When the user asks for code, give proper complete working code inside a fenced code block.
+- Never reveal server keys, internal routing, quota implementation, provider names or provider errors.
 - Never claim to have used a tool or capability you did not actually use.
+- If the user attached a file you cannot see, say so briefly instead of guessing its content.
 `;
+
+class AttachmentError extends Error {}
 
 function corsHeaders(origin = "") {
   const allowed = new Set([
@@ -360,6 +375,518 @@ async function identifyUser(req) {
 
 
 /* =========================================================
+   CLEAN RESPONSE (prose only, code is preserved)
+========================================================= */
+
+function cleanProse(text) {
+
+  return String(text)
+    .replace(/(\d)\s\*\s(?=\d)/g, "$1 \u00d7 ")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^(\s*)[-*\u2022]\s+/gm, "$1\u2022 ")
+    .replace(/\*{1,3}/g, "")
+    .replace(/__+/g, "")
+    .replace(/~~/g, "")
+    .replace(
+      /(^|[\s(])_([^_\n]+)_(?=[\s.,!?;:)]|$)/g,
+      "$1$2"
+    )
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+
+function cleanAiText(text) {
+
+  const original = String(text || "");
+
+  const cleaned =
+    original
+      .split(/(```[\s\S]*?(?:```|$)|`[^`\n]+`)/g)
+      .map(part => {
+
+        if (
+          part.startsWith("```") ||
+          (
+            part.length > 1 &&
+            part.startsWith("`") &&
+            part.endsWith("`")
+          )
+        ) {
+          return part;
+        }
+
+        return cleanProse(part);
+      })
+      .join("")
+      .trim();
+
+  return cleaned || original.trim();
+}
+
+
+/* =========================================================
+   ATTACHMENTS
+========================================================= */
+
+const EXT_MIME = {
+  pdf: "application/pdf",
+  txt: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  ogg: "audio/ogg",
+  flac: "audio/flac",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+  webm: "video/webm",
+  mpeg: "video/mpeg",
+  avi: "video/x-msvideo"
+};
+
+const DOCX_MIME =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const XLSX_MIME =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const PPTX_MIME =
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+
+function safeName(value) {
+
+  return String(value || "file")
+    .replace(/[\u0000-\u001f<>"`]/g, "")
+    .slice(0, 120) || "file";
+}
+
+function resolveMime(name, given) {
+
+  const mime =
+    String(given || "").toLowerCase().split(";")[0].trim();
+
+  if (mime && mime !== "application/octet-stream") {
+    return mime;
+  }
+
+  const ext =
+    (String(name).split(".").pop() || "").toLowerCase();
+
+  return EXT_MIME[ext] || "";
+}
+
+function decodeBase64Payload(raw) {
+
+  let data = String(raw || "");
+
+  const prefix = data.match(/^data:[^;,]*;base64,/i);
+  if (prefix) {
+    data = data.slice(prefix[0].length);
+  }
+
+  data = data.replace(/\s+/g, "");
+
+  if (
+    !data ||
+    data.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(data)
+  ) {
+    throw new AttachmentError(
+      "An attachment is damaged and could not be read."
+    );
+  }
+
+  const padding =
+    data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+
+  return {
+    base64: data,
+    bytes: Math.floor((data.length * 3) / 4) - padding
+  };
+}
+
+
+/* Minimal ZIP reader (central directory + inflate) for docx/xlsx/pptx. */
+function readZipEntries(buffer, wanted) {
+
+  const MAX_ENTRY = 25 * 1024 * 1024;
+  const out = {};
+
+  let eocd = -1;
+  const stop = Math.max(0, buffer.length - 65557);
+
+  for (let i = buffer.length - 22; i >= stop; i--) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+
+  if (eocd < 0) return out;
+
+  const count = buffer.readUInt16LE(eocd + 10);
+  let offset = buffer.readUInt32LE(eocd + 16);
+
+  for (let n = 0; n < count; n++) {
+
+    if (
+      offset + 46 > buffer.length ||
+      buffer.readUInt32LE(offset) !== 0x02014b50
+    ) {
+      break;
+    }
+
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const name =
+      buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+
+    offset += 46 + nameLength + extraLength + commentLength;
+
+    if (!wanted(name)) continue;
+
+    if (
+      localOffset + 30 > buffer.length ||
+      buffer.readUInt32LE(localOffset) !== 0x04034b50
+    ) {
+      continue;
+    }
+
+    const localName = buffer.readUInt16LE(localOffset + 26);
+    const localExtra = buffer.readUInt16LE(localOffset + 28);
+    const start = localOffset + 30 + localName + localExtra;
+    const raw = buffer.subarray(start, start + compressedSize);
+
+    try {
+      if (method === 0) {
+        if (raw.length <= MAX_ENTRY) out[name] = raw;
+      } else if (method === 8) {
+        out[name] = zlib.inflateRawSync(raw, {
+          maxOutputLength: MAX_ENTRY
+        });
+      }
+    } catch (error) {
+      /* skip unreadable entry */
+    }
+  }
+
+  return out;
+}
+
+function xmlText(value) {
+
+  return String(value)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function extractDocx(buffer) {
+
+  const files = readZipEntries(
+    buffer,
+    name => name === "word/document.xml"
+  );
+
+  const xml = files["word/document.xml"];
+  if (!xml) return "";
+
+  return xmlText(
+    xml
+      .toString("utf8")
+      .replace(/<w:tab\/>/g, "\t")
+      .replace(/<\/w:p>/g, "\n")
+      .replace(/<w:br\/>/g, "\n")
+      .replace(/<[^>]+>/g, "")
+  ).trim();
+}
+
+function extractXlsx(buffer) {
+
+  const files = readZipEntries(
+    buffer,
+    name =>
+      name === "xl/sharedStrings.xml" ||
+      /^xl\/worksheets\/sheet\d+\.xml$/.test(name)
+  );
+
+  const shared = [];
+  const sharedXml = files["xl/sharedStrings.xml"];
+
+  if (sharedXml) {
+    const items =
+      sharedXml.toString("utf8").match(/<si>[\s\S]*?<\/si>/g) || [];
+
+    for (const item of items) {
+      shared.push(
+        xmlText(
+          (item.match(/<t[^>]*>[\s\S]*?<\/t>/g) || [])
+            .map(t => t.replace(/<[^>]+>/g, ""))
+            .join("")
+        )
+      );
+    }
+  }
+
+  const sheetNames =
+    Object.keys(files)
+      .filter(name => name.startsWith("xl/worksheets/"))
+      .sort();
+
+  const lines = [];
+
+  sheetNames.forEach((name, index) => {
+
+    lines.push(`# Sheet ${index + 1}`);
+
+    const rows =
+      files[name].toString("utf8").match(/<row[\s\S]*?<\/row>/g) || [];
+
+    for (const row of rows.slice(0, 500)) {
+
+      const cells = [];
+      const cellMatches =
+        row.match(/<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g) || [];
+
+      for (const cell of cellMatches) {
+
+        const type = (cell.match(/\bt="([^"]*)"/) || [])[1];
+        const value = (cell.match(/<v>([\s\S]*?)<\/v>/) || [])[1];
+        const inline = (cell.match(/<t[^>]*>([\s\S]*?)<\/t>/) || [])[1];
+
+        if (type === "s" && value !== undefined) {
+          cells.push(shared[Number(value)] || "");
+        } else if (type === "inlineStr" && inline !== undefined) {
+          cells.push(xmlText(inline));
+        } else if (value !== undefined) {
+          cells.push(xmlText(value));
+        } else {
+          cells.push("");
+        }
+      }
+
+      lines.push(cells.join("\t"));
+    }
+  });
+
+  return lines.join("\n").trim();
+}
+
+function extractPptx(buffer) {
+
+  const files = readZipEntries(
+    buffer,
+    name => /^ppt\/slides\/slide\d+\.xml$/.test(name)
+  );
+
+  const names =
+    Object.keys(files).sort(
+      (a, b) =>
+        Number(a.match(/(\d+)\.xml$/)[1]) -
+        Number(b.match(/(\d+)\.xml$/)[1])
+    );
+
+  return names
+    .map((name, index) => {
+
+      const texts =
+        (files[name].toString("utf8").match(/<a:t>[\s\S]*?<\/a:t>/g) || [])
+          .map(t => xmlText(t.replace(/<[^>]+>/g, "")));
+
+      return `# Slide ${index + 1}\n${texts.join("\n")}`;
+    })
+    .join("\n\n")
+    .trim();
+}
+
+function parseAttachments(rawList) {
+
+  const result = {
+    mediaParts: [],
+    textBlocks: [],
+    mediaNames: []
+  };
+
+  if (rawList === undefined || rawList === null) {
+    return result;
+  }
+
+  if (!Array.isArray(rawList)) {
+    throw new AttachmentError("Attachments are not valid.");
+  }
+
+  if (rawList.length > MAX_ATTACHMENTS) {
+    throw new AttachmentError(
+      `You can attach up to ${MAX_ATTACHMENTS} files per message.`
+    );
+  }
+
+  let totalBytes = 0;
+  let totalChars = 0;
+
+  for (const raw of rawList) {
+
+    if (!raw || typeof raw !== "object") {
+      throw new AttachmentError("Attachments are not valid.");
+    }
+
+    const name = safeName(raw.name);
+    const mime = resolveMime(name, raw.mimeType || raw.type);
+    const { base64, bytes } = decodeBase64Payload(raw.data);
+
+    if (bytes > MAX_ATTACHMENT_BYTES) {
+      throw new AttachmentError(
+        `"${name}" is larger than 12 MB.`
+      );
+    }
+
+    totalBytes += bytes;
+
+    if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+      throw new AttachmentError(
+        "The attachments are too large in total."
+      );
+    }
+
+    if (/^image\/(png|jpeg|webp|heic|heif)$/.test(mime)) {
+
+      result.mediaParts.push({
+        type: "image",
+        data: base64,
+        mime_type: mime
+      });
+      result.mediaNames.push(name);
+
+    } else if (mime.startsWith("audio/")) {
+
+      result.mediaParts.push({
+        type: "audio",
+        data: base64,
+        mime_type: mime
+      });
+      result.mediaNames.push(name);
+
+    } else if (mime.startsWith("video/")) {
+
+      result.mediaParts.push({
+        type: "video",
+        data: base64,
+        mime_type: mime
+      });
+      result.mediaNames.push(name);
+
+    } else if (mime === "application/pdf") {
+
+      result.mediaParts.push({
+        type: "document",
+        data: base64,
+        mime_type: mime
+      });
+      result.mediaNames.push(name);
+
+    } else if (
+      mime === "text/plain" ||
+      mime === "text/markdown" ||
+      mime === "text/csv" ||
+      mime === "application/json"
+    ) {
+
+      const content =
+        Buffer.from(base64, "base64").toString("utf8");
+
+      result.textBlocks.push({ name, content });
+
+    } else if (
+      mime === DOCX_MIME ||
+      mime === XLSX_MIME ||
+      mime === PPTX_MIME
+    ) {
+
+      const buffer = Buffer.from(base64, "base64");
+      let content = "";
+
+      try {
+        content =
+          mime === DOCX_MIME ? extractDocx(buffer)
+          : mime === XLSX_MIME ? extractXlsx(buffer)
+          : extractPptx(buffer);
+      } catch (error) {
+        content = "";
+      }
+
+      if (!content) {
+        throw new AttachmentError(
+          `Could not read text from "${name}". Try saving it as a PDF.`
+        );
+      }
+
+      result.textBlocks.push({ name, content });
+
+    } else if (
+      mime === "application/msword" ||
+      mime === "application/vnd.ms-excel" ||
+      mime === "application/vnd.ms-powerpoint"
+    ) {
+
+      throw new AttachmentError(
+        "Old .doc / .xls / .ppt files are not supported. Please save the file as DOCX, XLSX, PPTX or PDF."
+      );
+
+    } else {
+
+      throw new AttachmentError(
+        `"${name}": this file type is not supported.`
+      );
+    }
+  }
+
+  /* Turn text files into bounded prompt text. */
+  result.textBlocks =
+    result.textBlocks.map(item => {
+
+      const room = Math.max(
+        0,
+        Math.min(
+          MAX_TEXT_CHARS_PER_FILE,
+          MAX_TEXT_CHARS_TOTAL - totalChars
+        )
+      );
+
+      const clipped = item.content.slice(0, room);
+      totalChars += clipped.length;
+
+      const note =
+        clipped.length < item.content.length
+          ? "\n[...file truncated...]"
+          : "";
+
+      return `[Attached file: ${item.name}]\n${clipped}${note}\n[End of file]`;
+    });
+
+  return result;
+}
+
+
+/* =========================================================
    MESSAGE BUILDERS
 ========================================================= */
 
@@ -648,12 +1175,14 @@ async function fetchJson(
 
 
 /* =========================================================
-   GEMINI
+   GEMINI (Interactions API)
+   input: string, or [{type:"text"}, {type:"image|audio|video|document", data, mime_type}]
 ========================================================= */
 
 async function callGemini(
   prompt,
-  history
+  history,
+  mediaParts = []
 ) {
 
   if (!GEMINI_API_KEY) {
@@ -661,6 +1190,23 @@ async function callGemini(
       "NO_GEMINI_KEY"
     );
   }
+
+  const transcript =
+    buildTranscript(
+      prompt,
+      history
+    );
+
+  const input =
+    mediaParts.length
+      ? [
+          {
+            type: "text",
+            text: transcript
+          },
+          ...mediaParts
+        ]
+      : transcript;
 
   const { data } =
     await fetchJson(
@@ -680,11 +1226,7 @@ async function callGemini(
           model:
             GEMINI_MODEL,
 
-          input:
-            buildTranscript(
-              prompt,
-              history
-            ),
+          input,
 
           system_instruction:
             SYSTEM_INSTRUCTION,
@@ -1114,7 +1656,8 @@ export default async function handler(
 
   const {
     prompt,
-    history
+    history,
+    attachments
   } =
     req.body || {};
 
@@ -1132,6 +1675,64 @@ export default async function handler(
           "A valid prompt is required."
       });
   }
+
+
+  /* Validate attachments BEFORE any quota is used. */
+
+  let files;
+
+  try {
+
+    files =
+      parseAttachments(
+        attachments
+      );
+
+  } catch (error) {
+
+    if (error instanceof AttachmentError) {
+
+      return res
+        .status(400)
+        .json({
+          code:
+            "INVALID_ATTACHMENT",
+
+          error:
+            error.message
+        });
+    }
+
+    console.warn(
+      "ORRAX attachment parsing failed"
+    );
+
+    return res
+      .status(400)
+      .json({
+        code:
+          "INVALID_ATTACHMENT",
+
+        error:
+          "The attachment could not be processed."
+      });
+  }
+
+
+  const fileText =
+    files.textBlocks.length
+      ? `\n\n${files.textBlocks.join("\n\n")}`
+      : "";
+
+  /* Prompt used by Gemini (it also receives the media itself). */
+  const geminiPrompt =
+    `${prompt.trim()}${fileText}`;
+
+  /* Prompt used by the other providers (they cannot view media). */
+  const fallbackPrompt =
+    files.mediaParts.length
+      ? `${geminiPrompt}\n\n[Note: the user also attached ${files.mediaNames.join(", ")}, which you cannot view. If it is needed to answer, say briefly that you could not open it.]`
+      : geminiPrompt;
 
 
   let reservation =
@@ -1174,8 +1775,9 @@ export default async function handler(
         "gemini",
         () =>
           callGemini(
-            prompt,
-            history
+            geminiPrompt,
+            history,
+            files.mediaParts
           )
       ],
 
@@ -1184,7 +1786,7 @@ export default async function handler(
         () =>
           callXKiro(
             XKIRO_KEYS[0],
-            prompt,
+            fallbackPrompt,
             history
           )
       ],
@@ -1194,7 +1796,7 @@ export default async function handler(
         () =>
           callXKiro(
             XKIRO_KEYS[1],
-            prompt,
+            fallbackPrompt,
             history
           )
       ],
@@ -1203,7 +1805,7 @@ export default async function handler(
         "dahl",
         () =>
           callDahl(
-            prompt,
+            fallbackPrompt,
             history
           )
       ],
@@ -1212,7 +1814,7 @@ export default async function handler(
         "openrouter",
         () =>
           callOpenRouter(
-            prompt,
+            fallbackPrompt,
             history
           )
       ]
@@ -1227,7 +1829,7 @@ export default async function handler(
         "groq",
         () =>
           callGroq(
-            prompt,
+            fallbackPrompt,
             history
           )
       ]);
@@ -1251,7 +1853,10 @@ export default async function handler(
         return res
           .status(200)
           .json({
-            text
+            text:
+              cleanAiText(
+                text
+              )
           });
 
       } catch (error) {
@@ -1281,7 +1886,7 @@ export default async function handler(
       .status(503)
       .json({
         code:
-          "TEMPORARILY_UNAVAILABLE",
+          "AI_TEMPORARILY_UNAVAILABLE",
 
         error:
           "AI_TEMPORARILY_UNAVAILABLE"
@@ -1311,7 +1916,7 @@ export default async function handler(
       .status(503)
       .json({
         code:
-          "TEMPORARILY_UNAVAILABLE",
+          "AI_TEMPORARILY_UNAVAILABLE",
 
         error:
           "AI_TEMPORARILY_UNAVAILABLE"
