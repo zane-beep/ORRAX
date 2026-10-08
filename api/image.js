@@ -1,9 +1,11 @@
 /* ORRAX /api/image
  * Server-only image router.
  * - 6 successful image generations per user per UTC day.
- * - Google users use verified Google ID-token `sub`.
+ * - Google users use verified Google ID-token `sub` (or the orrax_session cookie).
  * - Anonymous users use browser id + IP hash.
- * - xKiro free image model -> xKiro backup key -> Gemini image fallback.
+ * - No reference image: xKiro free image model -> xKiro backup key -> Gemini image fallback.
+ * - With reference image(s) (edit / "make this realistic"): Gemini multimodal image generation.
+ * - Prompts are wrapped in a strong photorealism instruction.
  * - Provider errors/keys/models are never returned to the browser.
  */
 
@@ -18,9 +20,14 @@ const GOOGLE_CLIENT_ID =
 const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY || "";
 
-const GEMINI_IMAGE_MODEL =
-  process.env.GEMINI_IMAGE_MODEL ||
-  "gemini-3.1-flash-image";
+/* If GEMINI_IMAGE_MODEL is set in Vercel it is always respected. */
+const GEMINI_IMAGE_MODEL_ENV =
+  process.env.GEMINI_IMAGE_MODEL || "";
+
+const GEMINI_IMAGE_MODEL_DEFAULTS = [
+  "gemini-nano-banana-2.1",
+  "gemini-3.1-flash-image"
+];
 
 const XKIRO_KEYS = [
   process.env.XKIRO_API_KEY,
@@ -29,6 +36,13 @@ const XKIRO_KEYS = [
 
 const XKIRO_FREE_IMAGE_MODEL =
   "sensenova/sensenova-u1.5-lite";
+
+/* Reference-image limits */
+const MAX_REFERENCES = 3;
+const MAX_REFERENCE_BYTES = 12 * 1024 * 1024;
+const MAX_TOTAL_REFERENCE_BYTES = 15 * 1024 * 1024;
+
+class AttachmentError extends Error {}
 
 
 function corsHeaders(origin = "") {
@@ -71,6 +85,196 @@ function sha256(value) {
     .digest("hex");
 }
 
+
+/* =========================================================
+   PHOTOREALISTIC PROMPT BUILDER
+========================================================= */
+
+/* If the user explicitly names an art style, respect it. */
+const EXPLICIT_STYLE_RE =
+  /\b(cartoon|anime|manga|comic|sketch|watercolou?r|oil painting|pixel art|vector|logo|icon|illustration|3d render|clay|low[- ]poly)\b|কার্টুন|অ্যানিমে|স্কেচ|ইলাস্ট্রেশন/i;
+
+function cleanUserPrompt(value) {
+
+  return String(value || "")
+    .replace(/[\u0000-\u001f]+/g, " ")
+    .replace(/"/g, "'")
+    .trim()
+    .slice(0, 1500);
+}
+
+function buildRealisticPrompt(
+  userPrompt,
+  hasReference
+) {
+
+  const request =
+    cleanUserPrompt(userPrompt);
+
+  if (EXPLICIT_STYLE_RE.test(request)) {
+
+    return `${request}\n\nHigh quality, accurate anatomy, clean details, no distorted hands or faces.`;
+  }
+
+  const lines = [];
+
+  if (hasReference) {
+
+    lines.push(
+      "Use the attached reference image(s) as the source. Keep the subject's identity, pose and composition unless the request asks to change them. Apply the request below and make the final result fully photorealistic."
+    );
+  }
+
+  lines.push(
+    "Create a FULLY PHOTOREALISTIC, lifelike photograph. The result must look like a real photo taken with a professional camera, not an artwork or a render."
+  );
+
+  lines.push(
+    `User request (it may be written in any language): "${request}"`
+  );
+
+  lines.push(
+    "Photographic requirements: natural lighting; realistic shadows; realistic reflections; realistic depth of field and perspective; realistic skin with natural pores and texture; realistic hair; realistic eyes; realistic hands with correct fingers; realistic clothing fabric and folds; accurate anatomy and proportions; realistic materials and textures; natural photographic colors; realistic exposure and contrast; believable environmental details; subtle natural imperfections; professional camera appearance; real-world photographic quality."
+  );
+
+  lines.push(
+    "Do NOT produce: cartoon, anime, manga, illustration, painting, sketch, comic, vector art, clay, toy-like or plastic-looking surfaces, low-poly, artificial CGI look, or a 3D-rendered look."
+  );
+
+  return lines.join("\n\n");
+}
+
+
+/* =========================================================
+   REFERENCE IMAGES (uploaded by the user)
+========================================================= */
+
+const EXT_MIME = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif"
+};
+
+function safeName(value) {
+
+  return String(value || "image")
+    .replace(/[\u0000-\u001f<>"`]/g, "")
+    .slice(0, 120) || "image";
+}
+
+function resolveMime(name, given) {
+
+  const mime =
+    String(given || "").toLowerCase().split(";")[0].trim();
+
+  if (mime && mime !== "application/octet-stream") {
+    return mime;
+  }
+
+  const ext =
+    (String(name).split(".").pop() || "").toLowerCase();
+
+  return EXT_MIME[ext] || "";
+}
+
+function decodeBase64Payload(raw) {
+
+  let data = String(raw || "");
+
+  const prefix = data.match(/^data:[^;,]*;base64,/i);
+  if (prefix) {
+    data = data.slice(prefix[0].length);
+  }
+
+  data = data.replace(/\s+/g, "");
+
+  if (
+    !data ||
+    data.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(data)
+  ) {
+    throw new AttachmentError(
+      "An attachment is damaged and could not be read."
+    );
+  }
+
+  const padding =
+    data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+
+  return {
+    base64: data,
+    bytes: Math.floor((data.length * 3) / 4) - padding
+  };
+}
+
+function parseReferenceImages(rawList) {
+
+  if (rawList === undefined || rawList === null) {
+    return [];
+  }
+
+  if (!Array.isArray(rawList)) {
+    throw new AttachmentError("Attachments are not valid.");
+  }
+
+  if (rawList.length > MAX_REFERENCES) {
+    throw new AttachmentError(
+      `You can use up to ${MAX_REFERENCES} reference images.`
+    );
+  }
+
+  const parts = [];
+  let total = 0;
+
+  for (const raw of rawList) {
+
+    if (!raw || typeof raw !== "object") {
+      throw new AttachmentError("Attachments are not valid.");
+    }
+
+    const name = safeName(raw.name);
+    const mime = resolveMime(name, raw.mimeType || raw.type);
+
+    if (!/^image\/(png|jpeg|webp|heic|heif)$/.test(mime)) {
+      throw new AttachmentError(
+        `"${name}": only PNG, JPEG, WEBP, HEIC or HEIF images can be used for image generation.`
+      );
+    }
+
+    const { base64, bytes } =
+      decodeBase64Payload(raw.data);
+
+    if (bytes > MAX_REFERENCE_BYTES) {
+      throw new AttachmentError(
+        `"${name}" is larger than 12 MB.`
+      );
+    }
+
+    total += bytes;
+
+    if (total > MAX_TOTAL_REFERENCE_BYTES) {
+      throw new AttachmentError(
+        "The reference images are too large in total."
+      );
+    }
+
+    parts.push({
+      type: "image",
+      data: base64,
+      mime_type: mime
+    });
+  }
+
+  return parts;
+}
+
+
+/* =========================================================
+   REDIS
+========================================================= */
 
 function getRedisConfig() {
 
@@ -231,8 +435,6 @@ async function identifyUser(
 
   /*
    * First try the ORRAX Google session cookie.
-   * This is important for the current
-   * GitHub Pages -> Vercel login flow.
    */
 
   const cookieHeader =
@@ -647,7 +849,13 @@ function extractGeminiImage(
       const image =
         part?.image ||
         part?.inline_data ||
-        part?.inlineData;
+        part?.inlineData ||
+        (
+          part?.type === "image" &&
+          part?.data
+            ? part
+            : null
+        );
 
 
       if (image?.data) {
@@ -677,8 +885,15 @@ function extractGeminiImage(
 }
 
 
+/*
+ * Gemini Interactions API.
+ * Text-to-image: input is a string.
+ * Reference / edit: input is [{type:"text"}, {type:"image", data, mime_type}, ...]
+ */
+
 async function generateWithGemini(
-  prompt
+  prompt,
+  references = []
 ) {
 
   if (!GEMINI_API_KEY) {
@@ -688,68 +903,106 @@ async function generateWithGemini(
     );
   }
 
+  const models =
+    GEMINI_IMAGE_MODEL_ENV
+      ? [GEMINI_IMAGE_MODEL_ENV]
+      : GEMINI_IMAGE_MODEL_DEFAULTS;
 
-  const data =
-    await fetchJson(
-      "https://generativelanguage.googleapis.com/v1beta/interactions",
-      {
-        method: "POST",
+  const input =
+    references.length
+      ? [
+          {
+            type: "text",
+            text: prompt
+          },
+          ...references
+        ]
+      : prompt;
 
-        headers: {
+  const responseFormat =
+    references.length
+      ? {
+          type: "image",
+          mime_type: "image/png"
+        }
+      : {
+          type: "image",
+          mime_type: "image/png",
+          aspect_ratio: "1:1",
+          image_size: "1K"
+        };
 
-          "Content-Type":
-            "application/json",
+  let lastError = null;
 
-          "x-goog-api-key":
-            GEMINI_API_KEY
-        },
+  for (const model of models) {
 
-        body:
-          JSON.stringify({
+    try {
 
-            model:
-              GEMINI_IMAGE_MODEL,
+      const data =
+        await fetchJson(
+          "https://generativelanguage.googleapis.com/v1beta/interactions",
+          {
+            method: "POST",
 
-            input:
-              prompt,
+            headers: {
 
-            response_format: {
+              "Content-Type":
+                "application/json",
 
-              type:
-                "image",
-
-              mime_type:
-                "image/png",
-
-              aspect_ratio:
-                "1:1",
-
-              image_size:
-                "1K"
+              "x-goog-api-key":
+                GEMINI_API_KEY
             },
 
-            store:
-              false
-          })
+            body:
+              JSON.stringify({
+
+                model,
+
+                input,
+
+                response_format:
+                  responseFormat,
+
+                store:
+                  false
+              })
+          }
+        );
+
+      const image =
+        extractGeminiImage(
+          data
+        );
+
+      if (image?.url) {
+        return image.url;
       }
-    );
 
+      lastError =
+        new Error(
+          "GEMINI_EMPTY_IMAGE"
+        );
 
-  const image =
-    extractGeminiImage(
-      data
-    );
+    } catch (error) {
 
+      lastError =
+        error;
 
-  if (!image?.url) {
-
-    throw new Error(
-      "GEMINI_EMPTY_IMAGE"
-    );
+      console.warn(
+        "ORRAX Gemini image model attempt failed",
+        error?.status ||
+        error?.message ||
+        "unknown"
+      );
+    }
   }
 
-
-  return image.url;
+  throw (
+    lastError ||
+    new Error(
+      "GEMINI_EMPTY_IMAGE"
+    )
+  );
 }
 
 
@@ -802,14 +1055,14 @@ export default async function handler(
 
   try {
 
-    const prompt =
+    const rawPrompt =
       String(
         req.body?.prompt ||
         ""
       ).trim();
 
 
-    if (!prompt) {
+    if (!rawPrompt) {
 
       return res
         .status(400)
@@ -818,6 +1071,41 @@ export default async function handler(
             "A valid image prompt is required."
         });
     }
+
+
+    /* Validate reference images BEFORE any quota is used. */
+
+    let references = [];
+
+    try {
+
+      references =
+        parseReferenceImages(
+          req.body?.attachments
+        );
+
+    } catch (error) {
+
+      return res
+        .status(400)
+        .json({
+
+          code:
+            "INVALID_ATTACHMENT",
+
+          error:
+            error instanceof AttachmentError
+              ? error.message
+              : "The attachment could not be processed."
+        });
+    }
+
+
+    const prompt =
+      buildRealisticPrompt(
+        rawPrompt,
+        references.length > 0
+      );
 
 
     const userKey =
@@ -856,37 +1144,45 @@ export default async function handler(
 
       /*
        * xKiro primary image provider.
+       * Skipped when the user sent reference images
+       * (xKiro image input support is not assumed).
        */
 
-      for (
-        const key of XKIRO_KEYS
+      if (
+        references.length === 0
       ) {
 
-        try {
+        for (
+          const key of XKIRO_KEYS
+        ) {
 
-          generatedUrl =
-            await generateWithXKiro(
-              key,
-              prompt
+          try {
+
+            generatedUrl =
+              await generateWithXKiro(
+                key,
+                prompt
+              );
+
+            if (
+              generatedUrl
+            ) {
+              break;
+            }
+
+          } catch (error) {
+
+            console.warn(
+              "ORRAX xKiro image attempt failed"
             );
-
-          if (
-            generatedUrl
-          ) {
-            break;
           }
-
-        } catch (error) {
-
-          console.warn(
-            "ORRAX xKiro image attempt failed"
-          );
         }
       }
 
 
       /*
-       * Gemini fallback.
+       * Gemini: fallback for plain prompts,
+       * primary for reference / edit requests.
        */
 
       if (
@@ -897,7 +1193,8 @@ export default async function handler(
 
           generatedUrl =
             await generateWithGemini(
-              prompt
+              prompt,
+              references
             );
 
         } catch (error) {
@@ -970,6 +1267,7 @@ export default async function handler(
 
     console.error(
       "ORRAX image route error:",
+      error?.message ||
       error
     );
 
